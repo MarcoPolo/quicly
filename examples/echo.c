@@ -41,6 +41,11 @@
 #include "quicly/streambuf.h"
 
 /**
+ * ALPN identifier for QUIC performance protocol
+ */
+static const char *alpn_perf = "perf";
+
+/**
  * the QUIC context
  */
 static quicly_context_t ctx;
@@ -48,6 +53,19 @@ static quicly_context_t ctx;
  * CID seed
  */
 static quicly_cid_plaintext_t next_cid;
+
+/**
+ * Performance protocol stream state
+ */
+typedef struct {
+    quicly_streambuf_t super;
+    uint8_t header_buf[8];      /* buffer for reading the 8-byte request size header */
+    size_t header_bytes_read;    /* how many bytes of header have been read */
+    uint64_t response_size;      /* requested response size from client */
+    uint64_t response_sent;      /* how many response bytes have been queued */
+    int client_mode;             /* 1 if this is a client stream, 0 if server */
+    int header_sent;             /* 1 if client has sent the request header */
+} perf_stream_t;
 
 static int resolve_address(struct sockaddr *sa, socklen_t *salen, const char *host, const char *port, int family, int type,
                            int proto)
@@ -93,14 +111,68 @@ static int is_server(void)
     return ctx.tls->certificates.count != 0;
 }
 
+/**
+ * Server-side ALPN negotiation callback
+ */
+static int on_client_hello_cb(ptls_on_client_hello_t *_self, ptls_t *tls, ptls_on_client_hello_parameters_t *params)
+{
+    size_t i;
+
+    /* Check if client proposed "perf" ALPN */
+    for (i = 0; i < params->negotiated_protocols.count; ++i) {
+        const ptls_iovec_t *protocol = &params->negotiated_protocols.list[i];
+        if (protocol->len == strlen(alpn_perf) && memcmp(protocol->base, alpn_perf, protocol->len) == 0) {
+            /* Set the negotiated protocol */
+            return ptls_set_negotiated_protocol(tls, alpn_perf, strlen(alpn_perf));
+        }
+    }
+
+    /* If "perf" not found in client's list, reject */
+    return PTLS_ALERT_NO_APPLICATION_PROTOCOL;
+}
+
+static ptls_on_client_hello_t on_client_hello = {on_client_hello_cb};
+
+/**
+ * Convert 64-bit value from host to network byte order
+ */
+static uint64_t hton64(uint64_t val)
+{
+    uint32_t high = (uint32_t)(val >> 32);
+    uint32_t low = (uint32_t)(val & 0xFFFFFFFF);
+    return ((uint64_t)htonl(low) << 32) | htonl(high);
+}
+
+/**
+ * Convert 64-bit value from network to host byte order
+ */
+static uint64_t ntoh64(uint64_t val)
+{
+    uint32_t high = (uint32_t)(val >> 32);
+    uint32_t low = (uint32_t)(val & 0xFFFFFFFF);
+    return ((uint64_t)ntohl(low) << 32) | ntohl(high);
+}
+
 static int forward_stdin(quicly_conn_t *conn)
 {
     quicly_stream_t *stream0;
+    perf_stream_t *perf;
     char buf[4096];
     size_t rret;
 
     if ((stream0 = quicly_get_stream(conn, 0)) == NULL || !quicly_sendstate_is_open(&stream0->sendstate))
         return 0;
+
+    perf = (perf_stream_t *)stream0->data;
+
+    /* Send the 8-byte request header first (client mode) */
+    if (perf->client_mode && !perf->header_sent) {
+        /* For this example, request 1MB response (can be made configurable) */
+        uint64_t request_size = 1024 * 1024; /* 1 MB */
+        uint64_t request_size_net = hton64(request_size);
+        quicly_streambuf_egress_write(stream0, &request_size_net, sizeof(request_size_net));
+        perf->header_sent = 1;
+    }
 
     while ((rret = read(0, buf, sizeof(buf))) == -1 && errno == EINTR)
         ;
@@ -113,6 +185,56 @@ static int forward_stdin(quicly_conn_t *conn)
         quicly_streambuf_egress_write(stream0, buf, rret);
         return 1;
     }
+}
+
+#define PERF_CHUNK_SIZE 65536
+
+static int perf_queue_next_chunk(quicly_stream_t *stream, perf_stream_t *perf)
+{
+    if (perf->response_size == 0 || perf->response_sent >= perf->response_size)
+        return 0;
+    if (!quicly_sendstate_is_open(&stream->sendstate))
+        return 0;
+    if (perf->super.egress.vecs.size != 0)
+        return 0;
+
+    static uint8_t zero_buf[PERF_CHUNK_SIZE] = {0}; /* reused between calls */
+    uint64_t remaining = perf->response_size - perf->response_sent;
+    size_t to_send = remaining < sizeof(zero_buf) ? (size_t)remaining : sizeof(zero_buf);
+    int ret = quicly_streambuf_egress_write(stream, zero_buf, to_send);
+    if (ret != 0) {
+        quicly_close(stream->conn, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0), "perf: failed to buffer response");
+        return ret;
+    }
+
+    perf->response_sent += to_send;
+    return 0;
+}
+
+static int perf_maybe_send_more(quicly_stream_t *stream, perf_stream_t *perf)
+{
+    int ret;
+
+    if ((ret = perf_queue_next_chunk(stream, perf)) != 0)
+        return ret;
+
+    if (perf->response_size != 0 && perf->response_sent >= perf->response_size && perf->super.egress.vecs.size == 0 &&
+        quicly_recvstate_transfer_complete(&stream->recvstate)) {
+        quicly_streambuf_egress_shutdown(stream);
+    }
+
+    return 0;
+}
+
+static void perf_on_send_shift(quicly_stream_t *stream, size_t delta)
+{
+    quicly_streambuf_egress_shift(stream, delta);
+
+    perf_stream_t *perf = (perf_stream_t *)stream->data;
+    if (perf == NULL)
+        return;
+
+    perf_maybe_send_more(stream, perf);
 }
 
 static void on_stop_sending(quicly_stream_t *stream, quicly_error_t err)
@@ -129,6 +251,8 @@ static void on_receive_reset(quicly_stream_t *stream, quicly_error_t err)
 
 static void on_receive(quicly_stream_t *stream, size_t off, const void *src, size_t len)
 {
+    perf_stream_t *perf = (perf_stream_t *)stream->data;
+
     /* read input to receive buffer */
     if (quicly_streambuf_ingress_receive(stream, off, src, len) != 0)
         return;
@@ -137,24 +261,50 @@ static void on_receive(quicly_stream_t *stream, size_t off, const void *src, siz
     ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
 
     if (is_server()) {
-        /* server: echo back to the client */
-        if (quicly_sendstate_is_open(&stream->sendstate) && (input.len > 0)) {
-            quicly_streambuf_egress_write(stream, input.base, input.len);
-            /* shutdown the stream after echoing all data */
-            if (quicly_recvstate_transfer_complete(&stream->recvstate))
-                quicly_streambuf_egress_shutdown(stream);
+        /* Server-side: implement performance protocol */
+        size_t consumed = 0;
+
+        /* Read the 8-byte request size header first */
+        if (perf->header_bytes_read < 8) {
+            size_t needed = 8 - perf->header_bytes_read;
+            size_t available = input.len < needed ? input.len : needed;
+
+            memcpy(perf->header_buf + perf->header_bytes_read, input.base, available);
+            perf->header_bytes_read += available;
+            consumed += available;
+
+            /* If we've read all 8 bytes, parse the request size */
+            if (perf->header_bytes_read == 8) {
+                uint64_t request_size_net;
+                memcpy(&request_size_net, perf->header_buf, 8);
+                perf->response_size = ntoh64(request_size_net);
+            }
+        }
+
+        /* Drain any remaining client data */
+        if (perf->header_bytes_read >= 8 && consumed < input.len) {
+            consumed = input.len; /* consume all remaining data */
+        }
+
+        /* Remove consumed bytes from receive buffer */
+        quicly_streambuf_ingress_shift(stream, consumed);
+
+        /* Send response data once we know the response size */
+        if (perf->header_bytes_read >= 8 && quicly_sendstate_is_open(&stream->sendstate)) {
+            if (perf_maybe_send_more(stream, perf) != 0)
+                return;
         }
     } else {
-        /* client: print to stdout */
+        /* Client: print received data to stdout */
         fwrite(input.base, 1, input.len, stdout);
         fflush(stdout);
         /* initiate connection close after receiving all data */
         if (quicly_recvstate_transfer_complete(&stream->recvstate))
             quicly_close(stream->conn, 0, "");
-    }
 
-    /* remove used bytes from receive buffer */
-    quicly_streambuf_ingress_shift(stream, input.len);
+        /* remove used bytes from receive buffer */
+        quicly_streambuf_ingress_shift(stream, input.len);
+    }
 }
 
 static void process_msg(int is_client, quicly_conn_t **conns, struct msghdr *msg, size_t dgram_len)
@@ -280,12 +430,23 @@ static int run_loop(int fd, quicly_conn_t *client)
 static quicly_error_t on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream)
 {
     static const quicly_stream_callbacks_t stream_callbacks = {
-        quicly_streambuf_destroy, quicly_streambuf_egress_shift, quicly_streambuf_egress_emit, on_stop_sending, on_receive,
+        quicly_streambuf_destroy, perf_on_send_shift, quicly_streambuf_egress_emit, on_stop_sending, on_receive,
         on_receive_reset};
     int ret;
 
-    if ((ret = quicly_streambuf_create(stream, sizeof(quicly_streambuf_t))) != 0)
+    /* Allocate perf_stream_t instead of quicly_streambuf_t */
+    if ((ret = quicly_streambuf_create(stream, sizeof(perf_stream_t))) != 0)
         return ret;
+
+    /* Initialize perf-specific fields */
+    perf_stream_t *perf = (perf_stream_t *)stream->data;
+    memset(perf->header_buf, 0, sizeof(perf->header_buf));
+    perf->header_bytes_read = 0;
+    perf->response_size = 0;
+    perf->response_sent = 0;
+    perf->header_sent = 0;
+    perf->client_mode = !is_server(); /* client if not server */
+
     stream->callbacks = &stream_callbacks;
     return 0;
 }
@@ -293,11 +454,15 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self, quicly_stream_t
 int main(int argc, char **argv)
 {
     ptls_openssl_sign_certificate_t sign_certificate;
+    static ptls_iovec_t alpn_list[1];
+    alpn_list[0] = ptls_iovec_init(alpn_perf, strlen(alpn_perf));
     ptls_context_t tlsctx = {
         .random_bytes = ptls_openssl_random_bytes,
         .get_time = &ptls_get_time,
         .key_exchanges = ptls_openssl_key_exchanges,
         .cipher_suites = ptls_openssl_cipher_suites,
+        .require_dhe_on_psk = 1,
+        .on_client_hello = &on_client_hello,
     };
     quicly_stream_open_t stream_open = {on_stream_open};
     char *host = "127.0.0.1", *port = "4433";
@@ -385,8 +550,13 @@ int main(int argc, char **argv)
     if (!is_server()) {
         /* initiate a connection, and open a stream */
         int ret;
-        if ((ret = quicly_connect(&client, &ctx, host, (struct sockaddr *)&sa, NULL, &next_cid, ptls_iovec_init(NULL, 0), NULL,
-                                  NULL, NULL)) != 0) {
+        ptls_handshake_properties_t hs_properties;
+        memset(&hs_properties, 0, sizeof(hs_properties));
+        hs_properties.client.negotiated_protocols.list = alpn_list;
+        hs_properties.client.negotiated_protocols.count = 1;
+
+        if ((ret = quicly_connect(&client, &ctx, host, (struct sockaddr *)&sa, NULL, &next_cid, ptls_iovec_init(NULL, 0),
+                                  &hs_properties, NULL, NULL)) != 0) {
             fprintf(stderr, "quicly_connect failed:%d\n", ret);
             exit(1);
         }
