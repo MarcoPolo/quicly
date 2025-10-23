@@ -308,11 +308,13 @@ static void on_receive(quicly_stream_t *stream, size_t off, const void *src, siz
         if (perf_maybe_send_more(stream, perf) != 0)
             return;
     } else {
+        ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
+
         // fprintf(stderr, "perf stream on receive : %zu bytes\n", perf->response_received);
-        if (len != 0) {
-            perf->response_received += len;
+        if (input.len != 0) {
+            perf->response_received += input.len;
             // fprintf(stderr, "perf stream response received: %zu/%zu bytes\n", perf->response_received, perf->response_size);
-            quicly_stream_sync_recvbuf(stream, len);
+            quicly_streambuf_ingress_shift(stream, input.len);
         }
 
         // if (perf->response_received == perf->response_size) {
